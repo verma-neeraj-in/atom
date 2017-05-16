@@ -6,8 +6,8 @@ StorageFolder = require '../storage-folder'
 Config = require '../config'
 FileRecoveryService = require './file-recovery-service'
 ipcHelpers = require '../ipc-helpers'
-{BrowserWindow, Menu, app, dialog, ipcMain, shell} = require 'electron'
-{CompositeDisposable} = require 'event-kit'
+{BrowserWindow, Menu, app, dialog, ipcMain, shell, screen} = require 'electron'
+{CompositeDisposable, Disposable} = require 'event-kit'
 fs = require 'fs-plus'
 path = require 'path'
 os = require 'os'
@@ -17,6 +17,7 @@ url = require 'url'
 _ = require 'underscore-plus'
 FindParentDir = null
 Resolve = null
+ConfigSchema = require '../config-schema'
 
 LocationSuffixRegExp = /(:\d+)(:\d+)?$/
 
@@ -34,7 +35,7 @@ class AtomApplication
     unless options.socketPath?
       if process.platform is 'win32'
         userNameSafe = new Buffer(process.env.USERNAME).toString('base64')
-        options.socketPath = "\\\\.\\pipe\\atom-#{options.version}-#{userNameSafe}-sock"
+        options.socketPath = "\\\\.\\pipe\\atom-#{options.version}-#{userNameSafe}-#{process.arch}-sock"
       else
         options.socketPath = path.join(os.tmpdir(), "atom-#{options.version}-#{process.env.USER}.sock")
 
@@ -63,16 +64,27 @@ class AtomApplication
   exit: (status) -> app.exit(status)
 
   constructor: (options) ->
-    {@resourcePath, @devResourcePath, @version, @devMode, @safeMode, @socketPath, @logFile, @setPortable, @userDataDir} = options
+    {@resourcePath, @devResourcePath, @version, @devMode, @safeMode, @socketPath, @logFile, @userDataDir} = options
     @socketPath = null if options.test or options.benchmark or options.benchmarkTest
     @pidsToOpenWindows = {}
     @windows = []
 
-    @config = new Config({configDirPath: process.env.ATOM_HOME, @resourcePath, enablePersistence: true})
-    @config.setSchema null, {type: 'object', properties: _.clone(require('../config-schema'))}
+    @config = new Config({enablePersistence: true})
+    @config.setSchema null, {type: 'object', properties: _.clone(ConfigSchema)}
+    ConfigSchema.projectHome = {
+      type: 'string',
+      default: path.join(fs.getHomeDirectory(), 'github'),
+      description: 'The directory where projects are assumed to be located. Packages created using the Package Generator will be stored here by default.'
+    }
+    @config.initialize({configDirPath: process.env.ATOM_HOME, @resourcePath, projectHomeSchema: ConfigSchema.projectHome})
     @config.load()
     @fileRecoveryService = new FileRecoveryService(path.join(process.env.ATOM_HOME, "recovery"))
     @storageFolder = new StorageFolder(process.env.ATOM_HOME)
+    @autoUpdateManager = new AutoUpdateManager(
+      @version,
+      options.test or options.benchmark or options.benchmarkTest,
+      @config
+    )
 
     @disposable = new CompositeDisposable
     @handleEvents()
@@ -84,16 +96,19 @@ class AtomApplication
   initialize: (options) ->
     global.atomApplication = this
 
-    @config.onDidChange 'core.useCustomTitleBar', @promptForRestart.bind(this)
+    # DEPRECATED: This can be removed at some point (added in 1.13)
+    # It converts `useCustomTitleBar: true` to `titleBar: "custom"`
+    if process.platform is 'darwin' and @config.get('core.useCustomTitleBar')
+      @config.unset('core.useCustomTitleBar')
+      @config.set('core.titleBar', 'custom')
 
-    @autoUpdateManager = new AutoUpdateManager(
-      @version, options.test or options.benchmark or options.benchmarkTest, @resourcePath, @config
-    )
+    @config.onDidChange 'core.titleBar', @promptForRestart.bind(this)
+
+    process.nextTick => @autoUpdateManager.initialize()
     @applicationMenu = new ApplicationMenu(@version, @autoUpdateManager)
     @atomProtocolHandler = new AtomProtocolHandler(@resourcePath, @safeMode)
 
     @listenForArgumentsFromNewProcess()
-    @setupJavaScriptArguments()
     @setupDockMenu()
 
     @launch(options)
@@ -106,6 +121,8 @@ class AtomApplication
 
   launch: (options) ->
     if options.pathsToOpen?.length > 0 or options.urlsToOpen?.length > 0 or options.test or options.benchmark or options.benchmarkTest
+      if @config.get('core.restorePreviousWindowsOnStart') is 'always'
+        @loadState(_.deepClone(options))
       @openWithOptions(options)
     else
       @loadState(options) or @openPath(options)
@@ -201,10 +218,6 @@ class AtomApplication
         # which is why this check is here.
         throw error unless error.code is 'ENOENT'
 
-  # Configures required javascript environment flags.
-  setupJavaScriptArguments: ->
-    app.commandLine.appendSwitch 'js-flags', '--harmony'
-
   # Registers basic application commands, non-idempotent.
   handleEvents: ->
     getLoadSettings = =>
@@ -278,6 +291,17 @@ class AtomApplication
 
     @disposable.add ipcHelpers.on ipcMain, 'restart-application', =>
       @restart()
+
+    @disposable.add ipcHelpers.on ipcMain, 'resolve-proxy', (event, requestId, url) ->
+      event.sender.session.resolveProxy url, (proxy) ->
+        unless event.sender.isDestroyed()
+          event.sender.send('did-resolve-proxy', requestId, proxy)
+
+    @disposable.add ipcHelpers.on ipcMain, 'did-change-history-manager', (event) =>
+      for atomWindow in @windows
+        webContents = atomWindow.browserWindow.webContents
+        if webContents isnt event.sender
+          webContents.send('did-change-history-manager')
 
     # A request from the associated render process to open a new render process.
     @disposable.add ipcHelpers.on ipcMain, 'open', (event, options) =>
@@ -383,6 +407,11 @@ class AtomApplication
     @disposable.add ipcHelpers.on ipcMain, 'did-save-path', (event, path) =>
       @fileRecoveryService.didSavePath(@atomWindowForEvent(event), path)
       event.returnValue = true
+
+    @disposable.add ipcHelpers.on ipcMain, 'did-change-paths', =>
+      @saveState(false)
+
+    @disposable.add(@disableZoomOnDisplayChange())
 
   setupDockMenu: ->
     if process.platform is 'darwin'
@@ -508,7 +537,7 @@ class AtomApplication
   openPaths: ({initialPaths, pathsToOpen, executedFrom, pidToKillWhenClosed, newWindow, devMode, safeMode, windowDimensions, profileStartup, window, clearWindowState, addToLastWindow, env}={}) ->
     if not pathsToOpen? or pathsToOpen.length is 0
       return
-
+    env = process.env unless env?
     devMode = Boolean(devMode)
     safeMode = Boolean(safeMode)
     clearWindowState = Boolean(clearWindowState)
@@ -548,6 +577,7 @@ class AtomApplication
       windowDimensions ?= @getDimensionsForNewWindow()
       openedWindow = new AtomWindow(this, @fileRecoveryService, {initialPaths, locationsToOpen, windowInitializationScript, resourcePath, devMode, safeMode, windowDimensions, profileStartup, clearWindowState, env})
       openedWindow.focus()
+      @lastFocusedWindow = openedWindow
 
     if pidToKillWhenClosed?
       @pidsToOpenWindows[pidToKillWhenClosed] = openedWindow
@@ -583,14 +613,13 @@ class AtomApplication
     states = []
     for window in @windows
       unless window.isSpec
-        if loadSettings = window.getLoadSettings()
-          states.push(initialPaths: loadSettings.initialPaths)
+        states.push({initialPaths: window.representedDirectoryPaths})
     if states.length > 0 or allowEmpty
       @storageFolder.storeSync('application.json', states)
+      @emit('application:did-save-state')
 
   loadState: (options) ->
-    restorePreviousState = @config.get('core.restorePreviousWindowsOnStart') ? true
-    if restorePreviousState and (states = @storageFolder.load('application.json'))?.length > 0
+    if (@config.get('core.restorePreviousWindowsOnStart') in ['yes', 'always']) and (states = @storageFolder.load('application.json'))?.length > 0
       for state in states
         @openWithOptions(Object.assign(options, {
           initialPaths: state.initialPaths
@@ -615,7 +644,8 @@ class AtomApplication
   openUrl: ({urlToOpen, devMode, safeMode, env}) ->
     unless @packages?
       PackageManager = require '../package-manager'
-      @packages = new PackageManager
+      @packages = new PackageManager()
+      @packages.initialize
         configDirPath: process.env.ATOM_HOME
         devMode: devMode
         resourcePath: @resourcePath
@@ -795,7 +825,6 @@ class AtomApplication
   restart: ->
     args = []
     args.push("--safe") if @safeMode
-    args.push("--portable") if @setPortable
     args.push("--log-file=#{@logFile}") if @logFile?
     args.push("--socket-path=#{@socketPath}") if @socketPath?
     args.push("--user-data-dir=#{@userDataDir}") if @userDataDir?
@@ -804,3 +833,17 @@ class AtomApplication
       args.push("--resource-path=#{@resourcePath}")
     app.relaunch({args})
     app.quit()
+
+  disableZoomOnDisplayChange: ->
+    outerCallback = =>
+      for window in @windows
+        window.disableZoom()
+
+    # Set the limits every time a display is added or removed, otherwise the
+    # configuration gets reset to the default, which allows zooming the
+    # webframe.
+    screen.on('display-added', outerCallback)
+    screen.on('display-removed', outerCallback)
+    new Disposable ->
+      screen.removeListener('display-added', outerCallback)
+      screen.removeListener('display-removed', outerCallback)
